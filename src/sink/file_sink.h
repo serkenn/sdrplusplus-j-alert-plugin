@@ -33,7 +33,9 @@ public:
 private:
     mutable std::mutex gate_;
     std::string path_;
+    bool open_locked();   // gate_ held
     std::FILE* fp_ = nullptr;
+    bool stopped_ = false;
     std::string status_;
     std::string error_;
     long long bytes_written_ = 0;
