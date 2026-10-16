@@ -70,25 +70,17 @@ FileJsonlSink::FileJsonlSink(const std::string& path) : path_(path) {
 // Opens the file positioned at a complete-record boundary. On failure the sink
 // stays in the error state and the next write_line retries.
 bool FileJsonlSink::open_locked() {
-    std::uintmax_t size = 0, record_end = 0;
     std::string err;
-    if (!scan_tail(path_, size, record_end, err)) { fail_locked(err); return false; }
-
-    bool need_newline = false;
-    if (record_end < size) {
-        if (partial_) {
-            // Our last write failed part-way and left an incomplete record:
-            // drop it so the next record is not glued onto it.
-            std::error_code ec;
-            std::filesystem::resize_file(path_, record_end, ec);
-            if (ec) { fail_locked("cannot trim incomplete record: " + ec.message()); return false; }
-        } else {
-            // Existing file not ending in '\n' (not ours, or left by a crash):
-            // start a new line instead of extending its last one.
-            need_newline = true;
-        }
+    if (partial_ && !trim_partial_locked(err)) {
+        fail_locked("cannot trim incomplete record: " + err);
+        return false;
     }
-    partial_ = false;
+
+    std::uintmax_t size = 0, record_end = 0;
+    if (!scan_tail(path_, size, record_end, err)) { fail_locked(err); return false; }
+    // Existing file not ending in '\n' (not ours, or left by a crash): start a
+    // new line instead of extending its last one.
+    const bool need_newline = record_end < size;
 
     fp_ = std::fopen(path_.c_str(), "ab");
     if (!fp_) { fail_locked(std::strerror(errno)); return false; }
@@ -99,9 +91,27 @@ bool FileJsonlSink::open_locked() {
         fp_ = nullptr;
         return false;
     }
+    good_size_ = size + (need_newline ? 1 : 0);
     status_ = std::string("writing → ") +
               std::filesystem::path(path_).filename().string();
     error_.clear();
+    return true;
+}
+
+// Cuts the file back to good_size_, the end of the last record known to be
+// complete, dropping whatever a failed write left behind (even if it ends in
+// '\n'). If the file has shrunk below that offset meanwhile (rotated or
+// truncated externally), falls back to its last line break.
+bool FileJsonlSink::trim_partial_locked(std::string& err) {
+    std::uintmax_t size = 0, record_end = 0;
+    if (!scan_tail(path_, size, record_end, err)) return false;
+    const std::uintmax_t keep = size >= good_size_ ? good_size_ : record_end;
+    if (size > keep) {
+        std::error_code ec;
+        std::filesystem::resize_file(path_, keep, ec);
+        if (ec) { err = ec.message(); return false; }
+    }
+    partial_ = false;
     return true;
 }
 
@@ -124,17 +134,23 @@ void FileJsonlSink::write_line(const std::string& line) {
     // Retry after an earlier open/write failure (e.g. a drive that came back).
     if (!fp_ && !open_locked()) return;
 
-    const size_t n = std::fwrite(line.data(), 1, line.size(), fp_);
-    const int wrote_nl = std::fputc('\n', fp_);
-    const int flush_rc = std::fflush(fp_);
-    if (n != line.size() || wrote_nl == EOF || flush_rc != 0) {
+    // Record and newline in one write: after a short write nothing more is
+    // appended, so a fragment never gets a line break of its own.
+    const std::string record = line + '\n';
+    const size_t n = std::fwrite(record.data(), 1, record.size(), fp_);
+    if (n != record.size() || std::fflush(fp_) != 0) {
         fail_locked(std::strerror(errno));
         std::fclose(fp_);
         fp_ = nullptr;
-        partial_ = true;   // part of the record may have reached the file
+        // Part of the record may have reached the file; drop it now if
+        // possible, otherwise before the next reopen.
+        partial_ = true;
+        std::string ignored;
+        trim_partial_locked(ignored);
         return;
     }
-    bytes_written_ += static_cast<long long>(line.size() + 1);
+    good_size_ += record.size();
+    bytes_written_ += static_cast<long long>(record.size());
     ++records_written_;
 }
 

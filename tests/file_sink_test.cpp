@@ -130,6 +130,48 @@ void test_partial_write_recovery() {
     CHECK_EQ(read_all(path), std::string("{\"zero\":0}\n{\"second\":2}\n"));
     std::filesystem::remove(path);
 }
+
+rlim_t g_restore_limit = RLIM_INFINITY;
+extern "C" void restore_limit_on_xfsz(int) {
+    // Linux setrlimit is a plain syscall; fine to call from this handler.
+    rlimit rl{};
+    getrlimit(RLIMIT_FSIZE, &rl);
+    rl.rlim_cur = g_restore_limit;
+    setrlimit(RLIMIT_FSIZE, &rl);
+}
+
+// Write availability returns in the middle of a record: the body is written
+// only partly, then further writes succeed again. Nothing may be appended to
+// the fragment (in particular not its newline), and the fragment must be gone
+// before the next record.
+void test_availability_returns_mid_record() {
+    const std::string path = temp_path("jalert_sink_midrecord.jsonl");
+    {
+        FileJsonlSink sink(path);
+        sink.write_line("{\"zero\":0}");
+        CHECK(sink.snapshot().error_message.empty());
+
+        // Larger than the sink's 64 KiB stdio buffer, so fwrite() itself hits
+        // the limit: 8 bytes are written, the next write raises SIGXFSZ, and the
+        // handler lifts the limit again before fwrite() returns short.
+        const std::string big = "{\"big\":\"" + std::string(200000, 'x') + "\"}";
+        g_restore_limit = set_fsize_limit(std::filesystem::file_size(path) + 8);
+        std::signal(SIGXFSZ, restore_limit_on_xfsz);
+        sink.write_line(big);
+        std::signal(SIGXFSZ, SIG_IGN);
+        set_fsize_limit(g_restore_limit);
+        CHECK(!sink.snapshot().error_message.empty());
+        CHECK_EQ(sink.snapshot().records_written, 1LL);
+        // The fragment is dropped right away, not only on recovery.
+        CHECK_EQ(read_all(path), std::string("{\"zero\":0}\n"));
+
+        sink.write_line("{\"second\":2}");
+        CHECK(sink.snapshot().error_message.empty());
+        CHECK_EQ(sink.snapshot().records_written, 2LL);
+    }
+    CHECK_EQ(read_all(path), std::string("{\"zero\":0}\n{\"second\":2}\n"));
+    std::filesystem::remove(path);
+}
 #endif
 
 } // namespace
@@ -140,6 +182,7 @@ int main() {
     test_no_writes_after_stop();
 #ifndef _WIN32
     test_partial_write_recovery();
+    test_availability_returns_mid_record();
 #endif
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
