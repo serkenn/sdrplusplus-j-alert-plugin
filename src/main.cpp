@@ -1,6 +1,7 @@
 #include <imgui.h>
 #include <config.h>
 #include <core.h>
+#include <gui/gui.h>
 #include <gui/style.h>
 #include <gui/widgets/menu.h>
 #include <module.h>
@@ -30,10 +31,6 @@
 #include "ui/constellation_view.h"
 #include "ui/sparkline.h"
 
-namespace gui {
-    extern Menu menu;
-}
-
 SDRPP_MOD_INFO{
     /* Name:            */ "j_alert_decoder",
     /* Description:     */ "J-ALERT satellite (BPSK SCPC) decoder",
@@ -52,6 +49,8 @@ constexpr double kInputSampleRate = jalert::dsp::BpskDemod::kWorkRate;  // 1.024
 constexpr double kVfoBandwidth = 400000.0;
 constexpr double kPushIntervalSec = 0.5;
 constexpr size_t kRecentAlerts = 32;
+// Coded BER under which the FEC is actually producing data (clean ≈ 0.00x).
+constexpr float kGoodBer = 0.05f;
 } // namespace
 
 // Lightweight per-file summary kept for the panel (no full XML — that goes to
@@ -131,6 +130,9 @@ public:
 
     void enable() override {
         if (enabled_) return;
+        // Fresh acquisition on re-enable (the DSP thread is stopped here), so
+        // disable/enable recovers the decoder without restarting SDR++.
+        recv_->reset();
         vfo_ = sigpath::vfoManager.createVFO(name_, ImGui::WaterfallVFO::REF_CENTER,
                                              0, kVfoBandwidth, kInputSampleRate,
                                              kVfoBandwidth, kVfoBandwidth, true);
@@ -180,11 +182,15 @@ private:
         const long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
 
-        // Fan out to JSONL sinks.
-        if (file_sink_ || tcp_sink_) {
-            const std::string line = jalert::sink::serialize_alert(a, now_ms);
-            if (file_sink_) file_sink_->write_line(line);
-            if (tcp_sink_)  tcp_sink_->write_line(line);
+        // Fan out to JSONL sinks. The UI thread swaps these pointers, so hold
+        // sinks_mtx_ while using them.
+        {
+            std::lock_guard<std::mutex> lk(sinks_mtx_);
+            if (file_sink_ || tcp_sink_) {
+                const std::string line = jalert::sink::serialize_alert(a, now_ms);
+                if (file_sink_) file_sink_->write_line(line);
+                if (tcp_sink_)  tcp_sink_->write_line(line);
+            }
         }
 
         // Auto-save every recovered file to the configured folder: decoded JMA
@@ -262,11 +268,14 @@ private:
             last_push_time_ = now;
         }
 
-        // Status lamp + label.
+        // Status lamp + label. "Locked" needs the FEC to agree: a carrier lock
+        // with a dead Viterbi (BER at the noise floor) decodes nothing.
+        const bool data_ok = recv_->ber() < kGoodBer;
         ImU32 lamp;
         const char* label;
         if (!enabled_)      { lamp = IM_COL32(120,120,120,255); label = "Disabled"; }
-        else if (locked)    { lamp = IM_COL32(70,180,85,255);  label = "Locked"; }
+        else if (locked && data_ok) { lamp = IM_COL32(70,180,85,255);  label = "Locked"; }
+        else if (locked)    { lamp = IM_COL32(220,170,40,255); label = "Carrier locked, no data"; }
         else if (demod.sym_mag() > 0.3f) { lamp = IM_COL32(220,170,40,255); label = "Signal, acquiring"; }
         else                { lamp = IM_COL32(200,70,70,255);  label = "Searching"; }
         ImGui::GetWindowDrawList()->AddCircleFilled(
@@ -297,6 +306,7 @@ private:
         ImGui::Text("HDLC frames: %lld ok / %lld rejected", fok, fbad);
         ImGui::Text("NowcastPackets: %lld  (status %lld)", pkts, recv_->status_packets());
         ImGui::Text("Files: %lld  decoded %lld", recv_->files(), recv_->alerts());
+        ImGui::Text("Re-acquisitions: %lld", recv_->loop_resets());
 
         ImGui::Separator();
         ImGui::TextUnformatted("Latest alert");
@@ -368,15 +378,12 @@ private:
         // toggling it starts (path non-empty) or stops the sink.
         bool file_on = static_cast<bool>(file_sink_);
         if (ImGui::Checkbox(("JSONL file output##filesink_" + name_).c_str(), &file_on)) {
-            if (file_on && !file_sink_path_.empty()) {
-                file_sink_ = std::make_unique<jalert::sink::FileJsonlSink>(file_sink_path_);
-                file_sink_enabled_ = true;
-                save_field("jsonlFileEnabled", true);
-            } else {
-                if (file_sink_) { file_sink_->stop(); file_sink_.reset(); }
-                file_sink_enabled_ = false;
-                save_field("jsonlFileEnabled", false);
-            }
+            std::unique_ptr<jalert::sink::FileJsonlSink> next;
+            if (file_on && !file_sink_path_.empty())
+                next = std::make_unique<jalert::sink::FileJsonlSink>(file_sink_path_);
+            file_sink_enabled_ = static_cast<bool>(next);
+            swap_sink(file_sink_, std::move(next));
+            save_field("jsonlFileEnabled", file_sink_enabled_);
         }
         ImGui::SetNextItemWidth(-1.0f);
         if (ImGui::InputText(("##fpath_" + name_).c_str(), file_sink_path_buf_,
@@ -387,21 +394,21 @@ private:
         }
         if (file_sink_) {
             const auto snap = file_sink_->snapshot();
-            ImGui::TextDisabled("%lld records", snap.records_written);
+            if (snap.error_message.empty())
+                ImGui::TextDisabled("%lld records", snap.records_written);
+            else
+                ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.3f, 1.0f), "Error: %s",
+                                   snap.error_message.c_str());
         }
 
         // JSONL TCP sink.
         bool tcp_on = static_cast<bool>(tcp_sink_);
         if (ImGui::Checkbox(("JSONL TCP output##tcpsink_" + name_).c_str(), &tcp_on)) {
-            if (tcp_on) {
-                tcp_sink_ = std::make_unique<jalert::sink::TcpJsonlSink>(tcp_sink_port_);
-                tcp_sink_enabled_ = true;
-                save_field("jsonlTcpEnabled", true);
-            } else {
-                if (tcp_sink_) { tcp_sink_->stop(); tcp_sink_.reset(); }
-                tcp_sink_enabled_ = false;
-                save_field("jsonlTcpEnabled", false);
-            }
+            std::unique_ptr<jalert::sink::TcpJsonlSink> next;
+            if (tcp_on) next = std::make_unique<jalert::sink::TcpJsonlSink>(tcp_sink_port_);
+            tcp_sink_enabled_ = static_cast<bool>(next);
+            swap_sink(tcp_sink_, std::move(next));
+            save_field("jsonlTcpEnabled", tcp_sink_enabled_);
         }
         ImGui::TextUnformatted("TCP port");
         ImGui::SetNextItemWidth(-1.0f);
@@ -411,8 +418,25 @@ private:
         if (ImGui::IsItemDeactivatedAfterEdit()) save_field("jsonlTcpPort", tcp_sink_port_);
         if (tcp_sink_) {
             const auto snap = tcp_sink_->snapshot();
-            ImGui::TextDisabled("%d client(s)", snap.client_count);
+            if (snap.error_message.empty())
+                ImGui::TextDisabled("%d client(s)", snap.client_count);
+            else
+                ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.3f, 1.0f), "Error: %s",
+                                   snap.error_message.c_str());
         }
+    }
+
+    // Replace a sink the DSP thread may be writing to. The old one is stopped
+    // outside the lock (TcpJsonlSink::stop joins threads).
+    template <class Sink>
+    void swap_sink(std::unique_ptr<Sink>& slot, std::unique_ptr<Sink> next) {
+        std::unique_ptr<Sink> old;
+        {
+            std::lock_guard<std::mutex> lk(sinks_mtx_);
+            old = std::move(slot);
+            slot = std::move(next);
+        }
+        if (old) old->stop();
     }
 
     template <class T>
@@ -448,6 +472,7 @@ private:
     bool tcp_sink_enabled_ = false;
 
     std::mutex ui_mtx_;
+    std::mutex sinks_mtx_;   // guards file_sink_/tcp_sink_ swaps vs. on_alert
     std::deque<AlertSummary> recent_;
 
     std::chrono::steady_clock::time_point start_time_{};
