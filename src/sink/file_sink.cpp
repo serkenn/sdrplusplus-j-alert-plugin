@@ -26,16 +26,22 @@ FileJsonlSink::FileJsonlSink(const std::string& path) : path_(path) {
         // best-effort directory create — fall through to fopen
     }
 
-    fp_ = std::fopen(path.c_str(), "ab");
+    std::lock_guard<std::mutex> lk(gate_);
+    open_locked();
+}
+
+bool FileJsonlSink::open_locked() {
+    fp_ = std::fopen(path_.c_str(), "ab");
     if (fp_) {
         std::setvbuf(fp_, nullptr, _IOFBF, 1 << 16);
         status_ = std::string("writing → ") +
-                  std::filesystem::path(path).filename().string();
-    } else {
-        const std::string msg = std::strerror(errno);
-        status_ = "error: " + msg;
-        error_ = msg;
+                  std::filesystem::path(path_).filename().string();
+        error_.clear();
+        return true;
     }
+    error_ = std::strerror(errno);
+    status_ = "error: " + error_;
+    return false;
 }
 
 FileJsonlSink::~FileJsonlSink() { stop(); }
@@ -48,7 +54,9 @@ std::string FileJsonlSink::status() const {
 void FileJsonlSink::write_line(const std::string& line) {
     if (line.empty()) return;
     std::lock_guard<std::mutex> lk(gate_);
-    if (!fp_) return;
+    if (stopped_) return;
+    // Retry after an earlier open/write failure (e.g. a drive that came back).
+    if (!fp_ && !open_locked()) return;
 
     const size_t n = std::fwrite(line.data(), 1, line.size(), fp_);
     const int wrote_nl = std::fputc('\n', fp_);
@@ -66,6 +74,7 @@ void FileJsonlSink::write_line(const std::string& line) {
 
 void FileJsonlSink::stop() {
     std::lock_guard<std::mutex> lk(gate_);
+    stopped_ = true;
     if (fp_) {
         std::fflush(fp_);
         std::fclose(fp_);
