@@ -1,7 +1,9 @@
 #pragma once
 // Append-mode JSONL file sink. Each line is written and flushed before
 // write_line returns. No fsync per line (a slow disk must not stall the
-// decoder).
+// decoder). After a failed write the sink retries on the next line; it first
+// trims any incomplete record the failure left, so appends resume on a record
+// boundary.
 
 #include <cstdio>
 #include <mutex>
@@ -34,8 +36,10 @@ private:
     mutable std::mutex gate_;
     std::string path_;
     bool open_locked();   // gate_ held
+    void fail_locked(const std::string& msg);   // gate_ held
     std::FILE* fp_ = nullptr;
     bool stopped_ = false;
+    bool partial_ = false;   // a failed write may have left an incomplete record
     std::string status_;
     std::string error_;
     long long bytes_written_ = 0;

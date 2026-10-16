@@ -62,6 +62,16 @@ else ()
     endif ()
 endif ()
 
+# ── Unit tests (no SDR++ runtime needed) ─────────────────────────────────────
+option(JALERT_BUILD_TESTS "Build unit tests" OFF)
+if (JALERT_BUILD_TESTS)
+    enable_testing()
+    add_executable(file_sink_test tests/file_sink_test.cpp src/sink/file_sink.cpp)
+    target_include_directories(file_sink_test PRIVATE "src/")
+    target_compile_features(file_sink_test PRIVATE cxx_std_17)
+    add_test(NAME file_sink_test COMMAND file_sink_test)
+endif ()
+
 find_package(ZLIB REQUIRED)
 
 # Sources
