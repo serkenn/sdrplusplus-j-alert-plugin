@@ -203,11 +203,35 @@ void test_rotated_file_rollback() {
     std::filesystem::remove(rotated);
 }
 
-// Another process holds the output file's lock (as a second SDR++ instance
-// does around each of its records). The sink must wait for it, so no append
-// of ours can land between another writer's append and our rollback.
-void test_cross_process_lock() {
-    const std::string path = temp_path("jalert_sink_xproc.jsonl");
+// A fragment sits at the end of the file and no rollback removed it (another
+// sink's write failed and its own truncate failed too, or it was killed). The
+// next writer must cut the fragment off, not append behind it.
+void test_fragment_from_other_writer() {
+    const std::string path = temp_path("jalert_sink_fragment.jsonl");
+    {
+        FileJsonlSink sink(path);
+        sink.write_line("{\"zero\":0}");
+        CHECK(sink.snapshot().error_message.empty());
+
+        const int fd = ::open(path.c_str(), O_WRONLY | O_APPEND);
+        CHECK(fd >= 0);
+        CHECK(::write(fd, "{\"first\"", 8) == 8);
+        ::close(fd);
+
+        // The sink is already open, so recovery cannot rely on a reopen.
+        sink.write_line("{\"second\":2}");
+        CHECK(sink.snapshot().error_message.empty());
+        CHECK_EQ(sink.snapshot().records_written, 2LL);
+    }
+    CHECK_EQ(read_all(path), std::string("{\"zero\":0}\n{\"second\":2}\n"));
+    std::filesystem::remove(path);
+}
+
+// Another writer holds the lock and does not let go. write_line runs on the
+// DSP thread and snapshot()/status() on the GUI thread, so none of them — nor
+// stop() — may wait for that writer.
+void test_lock_holder_does_not_block() {
+    const std::string path = temp_path("jalert_sink_busy.jsonl");
     write_raw(path, "{\"old\":1}\n");
     FileJsonlSink sink(path);   // opens and releases the lock again
 
@@ -220,7 +244,7 @@ void test_cross_process_lock() {
         flock(fd, LOCK_EX);
         char c = 'x';
         if (::write(fds[1], &c, 1) != 1) _exit(1);
-        usleep(300000);
+        usleep(2000000);   // far longer than the sink may wait
         flock(fd, LOCK_UN);
         ::close(fd);
         _exit(0);
@@ -232,15 +256,67 @@ void test_cross_process_lock() {
 
     const auto t0 = std::chrono::steady_clock::now();
     sink.write_line("{\"a\":1}");
+    const auto snap = sink.snapshot();
+    const std::string status = sink.status();
+    sink.stop();
     const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - t0).count();
-    CHECK(sink.snapshot().error_message.empty());
-    CHECK(waited >= 200);
+    CHECK(waited < 1000);
+    // The record is reported as not written instead of being written blindly.
+    CHECK(!snap.error_message.empty());
+    CHECK_EQ(snap.records_written, 0LL);
+    CHECK(!status.empty());
+
     int st = 0;
     waitpid(pid, &st, 0);
+    CHECK_EQ(read_all(path), std::string("{\"old\":1}\n"));
+    std::filesystem::remove(path);
+}
 
-    sink.stop();
-    CHECK_EQ(read_all(path), std::string("{\"old\":1}\n{\"a\":1}\n"));
+// Two processes writing at the same time, as two SDR++ instances on the default
+// output path do: the short lock wait must cover ordinary contention, so every
+// record lands and every line stays whole.
+void test_concurrent_processes_keep_every_record() {
+    const std::string path = temp_path("jalert_sink_concurrent.jsonl");
+    constexpr int kEach = 200;
+    const pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        FileJsonlSink child(path);
+        for (int i = 0; i < kEach; ++i) {
+            child.write_line("{\"c\":" + std::to_string(i) + "}");
+        }
+        const bool ok = child.snapshot().records_written == kEach;
+        child.stop();
+        _exit(ok ? 0 : 1);
+    }
+    {
+        FileJsonlSink parent(path);
+        for (int i = 0; i < kEach; ++i) {
+            parent.write_line("{\"p\":" + std::to_string(i) + "}");
+        }
+        CHECK_EQ(parent.snapshot().records_written, static_cast<long long>(kEach));
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    const std::string all = read_all(path);
+    int lines = 0, from_parent = 0, from_child = 0;
+    for (std::size_t start = 0; start < all.size();) {
+        const std::size_t nl = all.find('\n', start);
+        CHECK(nl != std::string::npos);   // no unterminated tail
+        if (nl == std::string::npos) break;
+        const std::string line = all.substr(start, nl - start);
+        start = nl + 1;
+        ++lines;
+        CHECK(!line.empty() && line.back() == '}');   // no truncated record
+        if (line.rfind("{\"p\":", 0) == 0)      ++from_parent;
+        else if (line.rfind("{\"c\":", 0) == 0) ++from_child;
+    }
+    CHECK_EQ(lines, 2 * kEach);
+    CHECK_EQ(from_parent, kEach);
+    CHECK_EQ(from_child, kEach);
     std::filesystem::remove(path);
 }
 
@@ -297,7 +373,9 @@ int main() {
     test_availability_returns_mid_record();
     test_shared_file_rollback();
     test_rotated_file_rollback();
-    test_cross_process_lock();
+    test_fragment_from_other_writer();
+    test_lock_holder_does_not_block();
+    test_concurrent_processes_keep_every_record();
 #endif
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
