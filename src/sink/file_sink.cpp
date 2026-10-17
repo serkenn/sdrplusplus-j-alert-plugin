@@ -7,10 +7,13 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <vector>
 
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <io.h>
+#else
+#include <unistd.h>
 #endif
 
 namespace jalert::sink {
@@ -57,16 +60,56 @@ bool scan_tail(const std::string& path, std::uintmax_t& size,
     return true;
 }
 
+#ifdef _WIN32
+using FileStat = struct ::_stat64;
+bool stat_open_file(std::FILE* fp, FileStat& st) {
+    return _fstat64(_fileno(fp), &st) == 0;
+}
+#else
+using FileStat = struct ::stat;
+bool stat_open_file(std::FILE* fp, FileStat& st) {
+    return fstat(fileno(fp), &st) == 0;
+}
+#endif
+
 // Current size of the open file, i.e. where the next append lands.
 bool open_file_size(std::FILE* fp, std::uintmax_t& size) {
-#ifdef _WIN32
-    struct _stat64 st;
-    if (_fstat64(_fileno(fp), &st) != 0) return false;
-#else
-    struct stat st;
-    if (fstat(fileno(fp), &st) != 0) return false;
-#endif
+    FileStat st;
+    if (!stat_open_file(fp, st)) return false;
     size = static_cast<std::uintmax_t>(st.st_size);
+    return true;
+}
+
+// Whether two handles refer to the same file. On Windows the CRT opens files
+// without FILE_SHARE_DELETE, so an open file cannot be renamed or replaced and
+// two handles on one path are always the same file.
+bool same_file(std::FILE* a, std::FILE* b) {
+#ifdef _WIN32
+    (void)a; (void)b;
+    return true;
+#else
+    FileStat sa, sb;
+    if (!stat_open_file(a, sa) || !stat_open_file(b, sb)) return true;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+#endif
+}
+
+// Cuts the file behind `fp` back to `keep` bytes. Works on the handle, not the
+// path, so a file renamed and replaced meanwhile is never touched. A file that
+// is already no longer than `keep` was truncated externally; leave it.
+bool truncate_open_file(std::FILE* fp, std::uintmax_t keep, std::string& err) {
+    std::uintmax_t size = 0;
+    if (!open_file_size(fp, size)) { err = std::strerror(errno); return false; }
+    if (size <= keep) return true;
+#ifdef _WIN32
+    const int e = _chsize_s(_fileno(fp), static_cast<__int64>(keep));
+    if (e != 0) { err = std::strerror(e); return false; }
+#else
+    if (ftruncate(fileno(fp), static_cast<off_t>(keep)) != 0) {
+        err = std::strerror(errno);
+        return false;
+    }
+#endif
     return true;
 }
 
@@ -80,9 +123,19 @@ std::string path_key(const std::string& path) {
 } // namespace
 
 struct FileJsonlSink::SharedFile {
+    // A failed write whose fragment could not be cut off yet. The handle is
+    // kept so the retry trims the same file, whatever `path` names by then.
+    struct Pending {
+        std::FILE* fp;
+        std::uintmax_t trim_to;   // file size just before that write
+    };
+
     std::mutex mu;   // serializes appends and rollback on this file
-    bool partial = false;   // a failed write may have left bytes past trim_to
-    std::uintmax_t trim_to = 0;   // file size just before that write
+    std::vector<Pending> pending;
+
+    ~SharedFile() {
+        for (auto& p : pending) std::fclose(p.fp);
+    }
 };
 
 // Every sink on the same path (e.g. several module instances on the default
@@ -124,22 +177,30 @@ FileJsonlSink::FileJsonlSink(const std::string& path) : path_(path) {
 // Opens the file positioned at a complete-record boundary. On failure the sink
 // stays in the error state and the next write_line retries.
 bool FileJsonlSink::open_locked() {
+    fp_ = std::fopen(path_.c_str(), "ab");
+    if (!fp_) { fail_locked(std::strerror(errno)); return false; }
+    // Unbuffered: whatever fwrite() did not write is never flushed later (e.g.
+    // by fclose), so after a rollback nothing more lands in the file.
+    std::setvbuf(fp_, nullptr, _IONBF, 0);
+
+    // A fragment of ours still in this file must go before the tail check
+    // below, or it would be kept as a line of its own.
     std::string err;
-    if (file_->partial && !trim_partial_locked(err)) {
+    if (!settle_pending_locked(err)) {
         fail_locked("cannot trim incomplete record: " + err);
+        close_locked();
         return false;
     }
 
     std::uintmax_t size = 0, record_end = 0;
-    if (!scan_tail(path_, size, record_end, err)) { fail_locked(err); return false; }
+    if (!scan_tail(path_, size, record_end, err)) {
+        fail_locked(err);
+        close_locked();
+        return false;
+    }
     // Existing file not ending in '\n' (not ours, or left by a crash): start a
     // new line instead of extending its last one.
-    const bool need_newline = record_end < size;
-
-    fp_ = std::fopen(path_.c_str(), "ab");
-    if (!fp_) { fail_locked(std::strerror(errno)); return false; }
-    std::setvbuf(fp_, nullptr, _IOFBF, 1 << 16);
-    if (need_newline && (std::fputc('\n', fp_) == EOF || std::fflush(fp_) != 0)) {
+    if (record_end < size && std::fputc('\n', fp_) == EOF) {
         fail_locked(std::strerror(errno));
         close_locked();
         return false;
@@ -150,24 +211,25 @@ bool FileJsonlSink::open_locked() {
     return true;
 }
 
-// Cuts the file back to its size before the failed write, dropping whatever
-// that write left behind (even if it ends in '\n'). Sinks on this file append
-// only under file_->mu and not while a trim is pending, so nothing past that
-// offset is another sink's record. If the file has shrunk below the offset
-// meanwhile (rotated or truncated externally), falls back to its last line
-// break.
-bool FileJsonlSink::trim_partial_locked(std::string& err) {
-    std::uintmax_t size = 0, record_end = 0;
-    if (!scan_tail(path_, size, record_end, err)) return false;
-    const std::uintmax_t keep =
-        size >= file_->trim_to ? file_->trim_to : record_end;
-    if (size > keep) {
-        std::error_code ec;
-        std::filesystem::resize_file(path_, keep, ec);
-        if (ec) { err = ec.message(); return false; }
+// Retries the rollback of earlier failed writes on their own handles.
+// Returns false if one of them is still pending on the file fp_ refers to.
+bool FileJsonlSink::settle_pending_locked(std::string& err) {
+    auto& pending = file_->pending;
+    bool blocked = false;
+    for (auto it = pending.begin(); it != pending.end();) {
+        std::string e;
+        if (truncate_open_file(it->fp, it->trim_to, e)) {
+            std::fclose(it->fp);
+            it = pending.erase(it);
+            continue;
+        }
+        if (fp_ && same_file(it->fp, fp_)) {
+            blocked = true;
+            err = e;
+        }
+        ++it;
     }
-    file_->partial = false;
-    return true;
+    return !blocked;
 }
 
 void FileJsonlSink::close_locked() {
@@ -194,14 +256,18 @@ void FileJsonlSink::write_line(const std::string& line) {
     std::lock_guard<std::mutex> lk(gate_);
     if (stopped_) return;
     std::lock_guard<std::mutex> flk(file_->mu);
-    // Another sink on this file left a fragment it could not trim yet: reopen,
-    // which trims first, instead of appending after it.
-    if (file_->partial) close_locked();
     // Retry after an earlier open/write failure (e.g. a drive that came back).
     if (!fp_ && !open_locked()) return;
+    // Never append after a fragment that is still waiting to be cut off.
+    std::string err;
+    if (!settle_pending_locked(err)) {
+        fail_locked("cannot trim incomplete record: " + err);
+        close_locked();
+        return;
+    }
 
     // Rollback point: the actual end of the file, which includes records
-    // appended by other sinks (each line is flushed, so nothing is buffered).
+    // appended by other sinks (the stream is unbuffered, so this is exact).
     std::uintmax_t before = 0;
     if (!open_file_size(fp_, before)) {
         fail_locked(std::strerror(errno));
@@ -213,15 +279,18 @@ void FileJsonlSink::write_line(const std::string& line) {
     // appended, so a fragment never gets a line break of its own.
     const std::string record = line + '\n';
     const size_t n = std::fwrite(record.data(), 1, record.size(), fp_);
-    if (n != record.size() || std::fflush(fp_) != 0) {
+    if (n != record.size()) {
         fail_locked(std::strerror(errno));
-        close_locked();
-        // Part of the record may have reached the file; drop it now if
-        // possible, otherwise before the next append by any sink on this file.
-        file_->partial = true;
-        file_->trim_to = before;
-        std::string ignored;
-        trim_partial_locked(ignored);
+        // Part of the record may have reached the file: cut it off through
+        // this same handle, which still refers to the file written even if
+        // the path was renamed and recreated. If that fails, keep the handle
+        // and retry before the next append to that file.
+        if (truncate_open_file(fp_, before, err)) {
+            close_locked();
+        } else {
+            file_->pending.push_back({fp_, before});
+            fp_ = nullptr;
+        }
         return;
     }
     bytes_written_ += static_cast<long long>(record.size());
@@ -231,7 +300,6 @@ void FileJsonlSink::write_line(const std::string& line) {
 void FileJsonlSink::stop() {
     std::lock_guard<std::mutex> lk(gate_);
     stopped_ = true;
-    if (fp_) std::fflush(fp_);
     close_locked();
     status_ = "off";
 }

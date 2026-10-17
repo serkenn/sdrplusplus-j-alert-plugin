@@ -164,6 +164,40 @@ void test_shared_file_rollback() {
     std::filesystem::remove(path);
 }
 
+// The output file is rotated (renamed, then recreated by another sink) while A
+// still holds the original. A's failed write must be rolled back in the
+// original file; the replacement must not be truncated with its offset.
+void test_rotated_file_rollback() {
+    std::signal(SIGXFSZ, SIG_IGN);
+    const std::string path = temp_path("jalert_sink_rotate.jsonl");
+    const std::string rotated = temp_path("jalert_sink_rotate.jsonl.1");
+    {
+        FileJsonlSink a(path);
+        a.write_line("{\"old\":1}");
+        std::filesystem::rename(path, rotated);
+        FileJsonlSink b(path);
+        b.write_line("{\"new\":1234567890}");
+        CHECK(b.snapshot().error_message.empty());
+
+        const rlim_t old = set_fsize_limit(std::filesystem::file_size(rotated) + 8);
+        a.write_line("{\"failed\":0}");
+        set_fsize_limit(old);
+        CHECK(!a.snapshot().error_message.empty());
+        CHECK_EQ(read_all(rotated), std::string("{\"old\":1}\n"));
+        CHECK_EQ(read_all(path), std::string("{\"new\":1234567890}\n"));
+
+        b.write_line("{\"new\":2}");
+        a.write_line("{\"after\":3}");   // reopens: now the replacement file
+        CHECK(a.snapshot().error_message.empty());
+        CHECK(b.snapshot().error_message.empty());
+    }
+    CHECK_EQ(read_all(rotated), std::string("{\"old\":1}\n"));
+    CHECK_EQ(read_all(path),
+             std::string("{\"new\":1234567890}\n{\"new\":2}\n{\"after\":3}\n"));
+    std::filesystem::remove(path);
+    std::filesystem::remove(rotated);
+}
+
 rlim_t g_restore_limit = RLIM_INFINITY;
 extern "C" void restore_limit_on_xfsz(int) {
     // Linux setrlimit is a plain syscall; fine to call from this handler.
@@ -184,9 +218,8 @@ void test_availability_returns_mid_record() {
         sink.write_line("{\"zero\":0}");
         CHECK(sink.snapshot().error_message.empty());
 
-        // Larger than the sink's 64 KiB stdio buffer, so fwrite() itself hits
-        // the limit: 8 bytes are written, the next write raises SIGXFSZ, and the
-        // handler lifts the limit again before fwrite() returns short.
+        // 8 bytes are written, the next write raises SIGXFSZ, and the handler
+        // lifts the limit again before fwrite() returns short.
         const std::string big = "{\"big\":\"" + std::string(200000, 'x') + "\"}";
         g_restore_limit = set_fsize_limit(std::filesystem::file_size(path) + 8);
         std::signal(SIGXFSZ, restore_limit_on_xfsz);
@@ -217,6 +250,7 @@ int main() {
     test_partial_write_recovery();
     test_availability_returns_mid_record();
     test_shared_file_rollback();
+    test_rotated_file_rollback();
 #endif
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

@@ -1,10 +1,12 @@
 #pragma once
 // Append-mode JSONL file sink. Each line is written and flushed before
 // write_line returns. No fsync per line (a slow disk must not stall the
-// decoder). After a failed write the file is cut back to its size just before
-// that write and the sink retries on the next line, so appends always resume on
-// a record boundary. Sinks in this process that target the same file share one
-// lock, so one sink's rollback never removes another sink's records.
+// decoder). After a failed write the file is cut back, through the handle that
+// wrote it, to its size just before that write, and the sink retries on the
+// next line, so appends always resume on a record boundary. Sinks in this
+// process that target the same file share one lock, so one sink's rollback
+// never removes another sink's records, and a rollback never touches a file
+// that replaced the original at the same path.
 
 #include <cstdint>
 #include <cstdio>
@@ -44,7 +46,7 @@ private:
     std::shared_ptr<SharedFile> file_;
     bool open_locked();   // gate_ and file_->mu held
     void fail_locked(const std::string& msg);   // gate_ held
-    bool trim_partial_locked(std::string& err);   // file_->mu held
+    bool settle_pending_locked(std::string& err);   // gate_ and file_->mu held
     void close_locked();   // gate_ held
     std::FILE* fp_ = nullptr;
     bool stopped_ = false;
