@@ -1,16 +1,18 @@
 #pragma once
-// Append-mode JSONL file sink. Each line is written and flushed before
-// write_line returns. No fsync per line (a slow disk must not stall the
-// decoder). After a failed write the file is cut back, through the handle that
-// wrote it, to its size just before that write, and the sink retries on the
-// next line, so appends always resume on a record boundary. Sinks in this
-// process that target the same file share one lock, so one sink's rollback
-// never removes another sink's records, and a rollback never touches a file
-// that replaced the original at the same path.
+// Append-mode JSONL file sink. Each line is written straight through (the
+// stream is unbuffered) before write_line returns. No fsync per line (a slow
+// disk must not stall the decoder).
+//
+// A record's size check, write and rollback run under an exclusive OS lock on
+// the file, and the rollback goes through the handle that made the write. So a
+// failed write is cut back to exactly what it added, even when other sinks —
+// in this process or in another SDR++ instance — append to the same file, and
+// even when the path has since been renamed and recreated. Appends therefore
+// always resume on a record boundary and every line in the file is a complete
+// record.
 
 #include <cstdint>
 #include <cstdio>
-#include <memory>
 #include <mutex>
 #include <string>
 
@@ -38,18 +40,20 @@ public:
     FileSinkSnapshot snapshot() const;
 
 private:
-    struct SharedFile;   // per-file state shared by every sink on that path
-    static std::shared_ptr<SharedFile> shared_file(const std::string& path);
-
     mutable std::mutex gate_;
     std::string path_;
-    std::shared_ptr<SharedFile> file_;
-    bool open_locked();   // gate_ and file_->mu held
-    void fail_locked(const std::string& msg);   // gate_ held
-    bool settle_pending_locked(std::string& err);   // gate_ and file_->mu held
-    void close_locked();   // gate_ held
+    bool open_locked();                            // gate_ held
+    bool lock_locked(std::string& err);            // gate_ held
+    void unlock_locked();                          // gate_ held
+    bool trim_pending_locked(std::string& err);    // gate_ and file lock held
+    void close_locked();                           // gate_ held
+    void ok_locked();                              // gate_ held
+    void fail_locked(const std::string& msg);      // gate_ held
     std::FILE* fp_ = nullptr;
+    bool locked_ = false;   // file lock held (kept while a rollback is due)
     bool stopped_ = false;
+    bool pending_ = false;   // a failed write left a fragment to cut off
+    std::uintmax_t trim_to_ = 0;   // file size just before that write
     std::string status_;
     std::string error_;
     long long bytes_written_ = 0;

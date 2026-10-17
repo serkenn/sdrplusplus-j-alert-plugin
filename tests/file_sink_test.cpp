@@ -12,8 +12,13 @@
 #include "sink/file_sink.h"
 
 #ifndef _WIN32
+#include <chrono>
 #include <csignal>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 using jalert::sink::FileJsonlSink;
@@ -198,6 +203,47 @@ void test_rotated_file_rollback() {
     std::filesystem::remove(rotated);
 }
 
+// Another process holds the output file's lock (as a second SDR++ instance
+// does around each of its records). The sink must wait for it, so no append
+// of ours can land between another writer's append and our rollback.
+void test_cross_process_lock() {
+    const std::string path = temp_path("jalert_sink_xproc.jsonl");
+    write_raw(path, "{\"old\":1}\n");
+    FileJsonlSink sink(path);   // opens and releases the lock again
+
+    int fds[2];
+    CHECK(pipe(fds) == 0);
+    const pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        const int fd = ::open(path.c_str(), O_WRONLY | O_APPEND);
+        flock(fd, LOCK_EX);
+        char c = 'x';
+        if (::write(fds[1], &c, 1) != 1) _exit(1);
+        usleep(300000);
+        flock(fd, LOCK_UN);
+        ::close(fd);
+        _exit(0);
+    }
+    ::close(fds[1]);
+    char c = 0;
+    CHECK(::read(fds[0], &c, 1) == 1);   // the child holds the lock now
+    ::close(fds[0]);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    sink.write_line("{\"a\":1}");
+    const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+    CHECK(sink.snapshot().error_message.empty());
+    CHECK(waited >= 200);
+    int st = 0;
+    waitpid(pid, &st, 0);
+
+    sink.stop();
+    CHECK_EQ(read_all(path), std::string("{\"old\":1}\n{\"a\":1}\n"));
+    std::filesystem::remove(path);
+}
+
 rlim_t g_restore_limit = RLIM_INFINITY;
 extern "C" void restore_limit_on_xfsz(int) {
     // Linux setrlimit is a plain syscall; fine to call from this handler.
@@ -251,6 +297,7 @@ int main() {
     test_availability_returns_mid_record();
     test_shared_file_rollback();
     test_rotated_file_rollback();
+    test_cross_process_lock();
 #endif
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
