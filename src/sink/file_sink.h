@@ -1,12 +1,14 @@
 #pragma once
 // Append-mode JSONL file sink. Each line is written and flushed before
 // write_line returns. No fsync per line (a slow disk must not stall the
-// decoder). After a failed write the file is cut back to the end of the last
-// complete record and the sink retries on the next line, so appends always
-// resume on a record boundary.
+// decoder). After a failed write the file is cut back to its size just before
+// that write and the sink retries on the next line, so appends always resume on
+// a record boundary. Sinks in this process that target the same file share one
+// lock, so one sink's rollback never removes another sink's records.
 
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -34,15 +36,18 @@ public:
     FileSinkSnapshot snapshot() const;
 
 private:
+    struct SharedFile;   // per-file state shared by every sink on that path
+    static std::shared_ptr<SharedFile> shared_file(const std::string& path);
+
     mutable std::mutex gate_;
     std::string path_;
-    bool open_locked();   // gate_ held
+    std::shared_ptr<SharedFile> file_;
+    bool open_locked();   // gate_ and file_->mu held
     void fail_locked(const std::string& msg);   // gate_ held
-    bool trim_partial_locked(std::string& err);   // gate_ held
+    bool trim_partial_locked(std::string& err);   // file_->mu held
+    void close_locked();   // gate_ held
     std::FILE* fp_ = nullptr;
     bool stopped_ = false;
-    bool partial_ = false;   // a failed write may have left an incomplete record
-    std::uintmax_t good_size_ = 0;   // file size after the last complete record
     std::string status_;
     std::string error_;
     long long bytes_written_ = 0;

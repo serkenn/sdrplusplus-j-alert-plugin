@@ -131,6 +131,39 @@ void test_partial_write_recovery() {
     std::filesystem::remove(path);
 }
 
+// Two sinks on one file (several module instances share the default output
+// path): rolling back A's failed write must not remove B's record.
+void test_shared_file_rollback() {
+    std::signal(SIGXFSZ, SIG_IGN);
+    const std::string path = temp_path("jalert_sink_shared.jsonl");
+    {
+        FileJsonlSink a(path);
+        FileJsonlSink b(path);
+        a.write_line("{\"from_a\":1}");
+        b.write_line("{\"from_b\":2}");
+        CHECK(a.snapshot().error_message.empty());
+        CHECK(b.snapshot().error_message.empty());
+
+        const rlim_t old = set_fsize_limit(std::filesystem::file_size(path) + 8);
+        a.write_line("{\"failed\":0}");
+        set_fsize_limit(old);
+        CHECK(!a.snapshot().error_message.empty());
+        CHECK_EQ(read_all(path),
+                 std::string("{\"from_a\":1}\n{\"from_b\":2}\n"));
+
+        a.write_line("{\"after\":3}");
+        b.write_line("{\"from_b\":4}");
+        CHECK(a.snapshot().error_message.empty());
+        CHECK(b.snapshot().error_message.empty());
+        CHECK_EQ(a.snapshot().records_written, 2LL);
+        CHECK_EQ(b.snapshot().records_written, 2LL);
+    }
+    CHECK_EQ(read_all(path),
+             std::string("{\"from_a\":1}\n{\"from_b\":2}\n{\"after\":3}\n"
+                         "{\"from_b\":4}\n"));
+    std::filesystem::remove(path);
+}
+
 rlim_t g_restore_limit = RLIM_INFINITY;
 extern "C" void restore_limit_on_xfsz(int) {
     // Linux setrlimit is a plain syscall; fine to call from this handler.
@@ -183,6 +216,7 @@ int main() {
 #ifndef _WIN32
     test_partial_write_recovery();
     test_availability_returns_mid_record();
+    test_shared_file_rollback();
 #endif
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
