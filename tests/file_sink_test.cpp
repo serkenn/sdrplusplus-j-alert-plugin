@@ -13,7 +13,10 @@
 
 #ifndef _WIN32
 #include <chrono>
+#include <climits>
 #include <csignal>
+#include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/resource.h>
@@ -360,7 +363,76 @@ void test_availability_returns_mid_record() {
     CHECK_EQ(read_all(path), std::string("{\"zero\":0}\n{\"second\":2}\n"));
     std::filesystem::remove(path);
 }
-#endif
+
+#ifdef __linux__
+volatile std::sig_atomic_t g_sink_fd = -1;
+volatile std::sig_atomic_t g_readonly_fd = -1;
+
+// Runs while the sink's write is failing part-way: the fragment has reached the
+// file, and swapping the sink's descriptor for a read-only one on the same file
+// makes the rollback's ftruncate() fail (EINVAL) without changing which file
+// the handle refers to. dup2() is async-signal-safe; the read-only descriptor
+// is opened beforehand.
+extern "C" void swap_to_readonly_on_xfsz(int) {
+    if (g_sink_fd >= 0 && g_readonly_fd >= 0) dup2(g_readonly_fd, g_sink_fd);
+}
+
+// The descriptor the sink has open on `path` — the only one pointing there.
+int find_open_fd(const std::string& path) {
+    char want[PATH_MAX];
+    if (!realpath(path.c_str(), want)) return -1;
+    for (int fd = 0; fd < 1024; ++fd) {
+        char link[64], target[PATH_MAX];
+        std::snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+        const ssize_t n = readlink(link, target, sizeof(target) - 1);
+        if (n < 0) continue;
+        target[n] = '\0';
+        if (std::strcmp(target, want) == 0) return fd;
+    }
+    return -1;
+}
+
+// Partial write -> the rollback fails too -> both faults go -> the next record
+// goes through the same sink instance. The fragment this sink left behind must
+// be cut off when it reopens, not taken for content that predates the sink and
+// kept with a line break of its own.
+void test_retry_after_failed_rollback() {
+    const std::string path = temp_path("jalert_sink_rollback_fail.jsonl");
+    const std::string head = "{\"zero\":0}\n";
+    {
+        FileJsonlSink sink(path);
+        sink.write_line("{\"zero\":0}");
+        CHECK(sink.snapshot().error_message.empty());
+
+        g_sink_fd = find_open_fd(path);
+        CHECK(g_sink_fd >= 0);
+        g_readonly_fd = ::open(path.c_str(), O_RDONLY);
+        CHECK(g_readonly_fd >= 0);
+
+        std::signal(SIGXFSZ, swap_to_readonly_on_xfsz);
+        const rlim_t old = set_fsize_limit(std::filesystem::file_size(path) + 8);
+        sink.write_line("{\"first\":1}");
+        set_fsize_limit(old);
+        std::signal(SIGXFSZ, SIG_IGN);
+        ::close(g_readonly_fd);
+        g_readonly_fd = g_sink_fd = -1;
+
+        CHECK(!sink.snapshot().error_message.empty());
+        CHECK_EQ(sink.snapshot().records_written, 1LL);
+        // The rollback could not run, so the fragment is still in the file.
+        const std::string after_fail = read_all(path);
+        CHECK(after_fail.rfind(head, 0) == 0);
+        CHECK(after_fail.size() > head.size());
+
+        sink.write_line("{\"second\":2}");
+        CHECK(sink.snapshot().error_message.empty());
+        CHECK_EQ(sink.snapshot().records_written, 2LL);
+    }
+    CHECK_EQ(read_all(path), head + "{\"second\":2}\n");
+    std::filesystem::remove(path);
+}
+#endif   // __linux__
+#endif   // !_WIN32
 
 } // namespace
 
@@ -371,6 +443,9 @@ int main() {
 #ifndef _WIN32
     test_partial_write_recovery();
     test_availability_returns_mid_record();
+#ifdef __linux__
+    test_retry_after_failed_rollback();   // needs /proc to find the sink's fd
+#endif
     test_shared_file_rollback();
     test_rotated_file_rollback();
     test_fragment_from_other_writer();

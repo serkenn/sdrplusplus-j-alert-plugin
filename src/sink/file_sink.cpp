@@ -136,6 +136,26 @@ bool file_size_of(std::FILE* fp, std::uintmax_t& size) {
     return true;
 }
 
+// Which file the handle refers to, so a reopen can tell the file a failed write
+// left a fragment in from a replacement that has taken over the path since.
+bool identify_file(std::FILE* fp, FileIdentity& id) {
+#ifdef _WIN32
+    auto h = reinterpret_cast<HANDLE>(_get_osfhandle(fd_of(fp)));
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(h, &info)) return false;
+    id.volume = info.dwVolumeSerialNumber;
+    id.index = (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32) |
+               info.nFileIndexLow;
+#else
+    struct ::stat st;
+    if (fstat(fd_of(fp), &st) != 0) return false;
+    id.volume = static_cast<std::uint64_t>(st.st_dev);
+    id.index = static_cast<std::uint64_t>(st.st_ino);
+#endif
+    id.valid = true;
+    return true;
+}
+
 // Reads n bytes at `off` without disturbing where the next append lands (the
 // handle is O_APPEND, so writes always go to the end).
 bool read_at(std::FILE* fp, char* buf, std::size_t n, std::uintmax_t off) {
@@ -216,6 +236,38 @@ bool FileJsonlSink::open_locked() {
     FileLock lock;
     if (!lock.acquire(fp_, err)) { fail_locked(err); close_locked(); return false; }
 
+    // An unterminated tail is this sink's own fragment only if a write of ours
+    // failed, its rollback failed too, and this is still the file that write
+    // went to — not a replacement that has taken over the path since.
+    if (fragment_pending_) {
+        FileIdentity now;
+        if (!fragment_file_.valid || !identify_file(fp_, now)) {
+            // Without both identities there is no telling the fragment from
+            // content to keep, and either guess risks a malformed record or
+            // lost data: stay in the error state; the next write tries again.
+            fail_locked("cannot identify the file holding an incomplete record");
+            lock.release();
+            close_locked();
+            return false;
+        }
+        if (now.is(fragment_file_)) {
+            // Ours: cut it off. Nothing can have been appended behind it, since
+            // every writer trims the tail before it appends.
+            if (!repair_tail_locked(err)) {
+                fail_locked("cannot trim incomplete record: " + err);
+                lock.release();
+                close_locked();
+                return false;
+            }
+            fragment_pending_ = false;
+            ok_locked();
+            return true;
+        }
+        // A fragment in a file this path no longer names is out of reach; the
+        // writer still holding that file removes it.
+        fragment_pending_ = false;
+    }
+
     std::uintmax_t size = 0, record_end = 0;
     if (!scan_tail(fp_, size, record_end, err)) {
         fail_locked(err);
@@ -225,8 +277,9 @@ bool FileJsonlSink::open_locked() {
     }
     // Content already there and not ending in '\n' predates this sink (a file
     // that is not ours, or one left by a killed process): keep it and start a
-    // new line rather than extending its last one. From here on an unterminated
-    // tail can only be a fragment of a failed write, which write_line cuts off.
+    // new line rather than extending its last one. A fragment of our own never
+    // lands here — it is cut off above — and from here on an unterminated tail
+    // can only be a fragment of a failed write, which write_line cuts off.
     if (record_end < size && std::fputc('\n', fp_) == EOF) {
         err = std::strerror(errno);
         lock.release();
@@ -312,9 +365,15 @@ void FileJsonlSink::write_line(const std::string& line) {
     if (n != record.size()) {
         err = std::strerror(errno);
         // Drop whatever reached the file. If this fails the fragment stays and
-        // the next writer removes it, so nothing hangs on it succeeding.
+        // the next writer removes it, so nothing hangs on it succeeding — but
+        // note which file it is in, so our own reopen below cuts it off instead
+        // of taking it for content that predates the sink.
         std::string ignored;
-        truncate_open_file(fp_, before, ignored);
+        if (!truncate_open_file(fp_, before, ignored)) {
+            fragment_file_ = FileIdentity{};
+            identify_file(fp_, fragment_file_);
+            fragment_pending_ = true;
+        }
         lock.release();
         fail_locked(err);
         close_locked();   // the next write reopens, picking up a rotation
